@@ -65,47 +65,41 @@ async def verify_github_signature(request: Request):
 
 async def process_pr_review_task(commit_sha: str, pr_data: dict):
     """
-    Asynchronous background worker function that performs the heavy lifting:
-    Uses httpx to non-blockingly download diff data, checks Redis cache, and invokes Gemini.
+    Hardened Asynchronous background worker loop.
+    Fully non-blocking execution via httpx, aioredis, and gemini_client.aio.
     """
     cache_key = f"pr_review:{commit_sha}"
+    print(f"[Worker Active] Commencing evaluation task for commit: {commit_sha}", flush=True)
     
     try:
         # 1. Double check cache hit inside worker
         cached_review = await redis_client.get(cache_key)
         if cached_review:
-            print(f"[Worker Cache Hit] Review already completed for commit {commit_sha}. Skipping API invocation.")
+            print(f"[Worker Cache Hit] Review already completed for commit {commit_sha}. Skipping API invocation.", flush=True)
             return
 
         if not gemini_client:
-            print("[Worker Error] Gemini Client not initialized. Skipping review computation.")
+            print("[Worker Error] Gemini Client not initialized. Skipping review computation.", flush=True)
             return
 
-        # 2. DYNAMICALLY FETCH REAL DIFF VIA HTTPX (NON-BLOCKING)
+        # 2. Dynamically fetch real diff via HTTPX
         pull_request_obj = pr_data.get("pull_request", {})
         diff_url = pull_request_obj.get("diff_url")
         
         if not diff_url:
-            print("[Worker Error] Could not find diff_url in payload.")
+            print("[Worker Error] Could not find diff_url in payload.", flush=True)
             return
             
-        # Build headers for private repo access or custom diff media types
-        headers = {
-            "Accept": "application/vnd.github.v3.diff"
-        }
+        headers = {"Accept": "application/vnd.github.v3.diff"}
         if GITHUB_TOKEN:
             headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
             
-        # Perform a completely non-blocking async network call
         diff_response = await http_client.get(diff_url, headers=headers)
-        
         if diff_response.status_code != 200:
-            print(f"[Worker Error] Failed to fetch diff from GitHub via HTTPX: {diff_response.status_code}")
+            print(f"[Worker Error] Failed to fetch diff from GitHub via HTTPX: {diff_response.status_code}", flush=True)
             return
             
         real_diff = diff_response.text
-
-        # Enforce budget guardrails
         if len(real_diff) > 50000: 
             real_diff = real_diff[:50000] + "\n\n[Warning: Diff truncated due to token size constraints]"
 
@@ -116,8 +110,11 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
             "Return your critical response structured in clean markdown format."
         )
 
-        # 3. Invoke Gemini Inference via modern SDK 
-        response = gemini_client.models.generate_content(
+        # 3. Invoke Gemini Inference via MODERN NON-BLOCKING ASYNC SDK (.aio) ◄ NEW
+        print(f"[Worker Progress] Handshaking with Gemini 3.8-Flash engine...", flush=True)
+        
+        # We leverage the .aio property of the modern Google GenAI Client wrapper
+        response = await gemini_client.aio.models.generate_content(
             model='gemini-3.8-flash',  
             contents=f"Analyze this code diff payload:\n{real_diff}",
             config=types.GenerateContentConfig(
@@ -126,18 +123,17 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
         )
         
         generated_review = response.text
-        print(f"[Worker Success] Generated Review Output for {commit_sha}")
+        print(f"[Worker Success] Generated Review Output for {commit_sha}", flush=True)
 
-        # 4. Write back to Redis Cache with a 24-hour TTL (86400 seconds) to save API budget
+        # 4. Write back to Redis Cache with a 24-hour TTL
         await redis_client.setex(cache_key, 86400, generated_review)
         
-        # 5. POST COMMENT BACK TO THE GITHUB PULL REQUEST 
-        # (PyGithub is synchronous, but running inside FastAPI's background task 
-        # isolates its blocking nature from interfering with incoming requests)
+        # 5. Post comment back to GitHub Pull Request
         if GITHUB_TOKEN:
             repo_full_name = pr_data.get("repository", {}).get("full_name")
             pr_number = pr_data.get("number")
             
+            print(f"[Worker Progress] Posting text blocks to GitHub repository...", flush=True)
             auth = Auth.Token(GITHUB_TOKEN)
             g = Github(auth=auth)
             
@@ -145,12 +141,16 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
             pull_request = repo.get_pull(pr_number)
             
             pull_request.create_issue_comment(generated_review)
-            print(f"[GitHub Success] Posted review comment to PR #{pr_number}")
+            print(f"[GitHub Success] Posted review comment to PR #{pr_number}", flush=True)
         else:
-            print("[Warning] GITHUB_TOKEN not found. Skipping comment insertion.")
+            print("[Warning] GITHUB_TOKEN not found. Skipping comment insertion.", flush=True)
 
-    except Exception as e:
-        print(f"[Worker Exception] Failed to execute LLM evaluation or caching layer: {e}")
+    except Exception as worker_error:
+        # ◄ THE CRITICAL BACKEND WRAPPER: Catches any silent failures and prints them explicitly
+        print(f"\n❌ [FATAL WORKER CRASH] An exception occurred inside the background worker thread!", flush=True)
+        print(f"Details: {str(worker_error)}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 @app.post("/webhook/github", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_github_signature)])
 async def github_webhook_endpoint(request: Request, background_tasks: BackgroundTasks):
