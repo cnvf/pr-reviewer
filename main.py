@@ -1,19 +1,20 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import hmac
 import hashlib
 import json
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends, status
+import asyncio
+from fastapi import FastAPI, Request, HTTPException, status
 from google import genai
 from google.genai import types
 import redis.asyncio as aioredis
-import httpx
+import httpx                 
 from github import Github     
 from github import Auth       
 
-load_dotenv()  # Load environment variables from .env file
-
-app = FastAPI(title="Fully Async GitHub PR Reviewer API", version="1.2.0")
+app = FastAPI(title="Production Async GitHub PR Reviewer API", version="1.3.0")
 
 # Infrastructure Configurations
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "super_secret_webhook_token")
@@ -22,19 +23,22 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
 
 # Global clients initialization
-gemini_client = None
-if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
 redis_client: aioredis.Redis = None
-http_client: httpx.AsyncClient = None
+http_client: httpx.AsyncClient = None  
+gemini_async_client = None  # ◄ CHANGED: Dedicated explicit async client reference
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize asynchronous connection pools on application startup."""
-    global redis_client, http_client
+    global redis_client, http_client, gemini_async_client
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    http_client = httpx.AsyncClient()
+    http_client = httpx.AsyncClient()  
+    
+    # ◄ FIXED: Properly initialize the dedicated async client using .aio on startup
+    if GEMINI_API_KEY:
+        gemini_async_client = genai.Client(api_key=GEMINI_API_KEY).aio
+    else:
+        print("[Startup Warning] GEMINI_API_KEY environment variable missing!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -43,43 +47,34 @@ async def shutdown_event():
     if redis_client:
         await redis_client.close()
     if http_client:
-        await http_client.aclose()
+        await http_client.aclose()  
 
-async def verify_github_signature(request: Request):
+def verify_github_signature_raw(payload_body: bytes, signature_header: str) -> bool:
     """Cryptographically verify that the webhook signature matches the computed HMAC-SHA256."""
-    signature_header = request.headers.get("X-Hub-Signature-256")
-    if not signature_header:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Hub-Signature-256 header")
-    
-    if not signature_header.startswith("sha256="):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature format. Must be sha256.")
-        
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
     expected_signature = signature_header.split("sha256=")[-1]
-    payload_body = await request.body()
-    
     computed_mac = hmac.new(GITHUB_WEBHOOK_SECRET.encode(), msg=payload_body, digestmod=hashlib.sha256)
-    computed_signature = computed_mac.hexdigest()
-    
-    if not hmac.compare_digest(computed_signature, expected_signature):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cryptographic signature verification failed.")
+    return hmac.compare_digest(computed_mac.hexdigest(), expected_signature)
 
 async def process_pr_review_task(commit_sha: str, pr_data: dict):
     """
     Hardened Asynchronous background worker loop.
-    Fully non-blocking execution via httpx, aioredis, and gemini_client.aio.
+    Fully non-blocking execution via httpx, aioredis, and gemini_async_client.
     """
+    # This print statement is guaranteed to run the microsecond the task is spawned!
+    print(f"\n🚀 [WORKER STARTING] Processing initiated for commit: {commit_sha}", flush=True)
     cache_key = f"pr_review:{commit_sha}"
-    print(f"[Worker Active] Commencing evaluation task for commit: {commit_sha}", flush=True)
     
     try:
         # 1. Double check cache hit inside worker
         cached_review = await redis_client.get(cache_key)
         if cached_review:
-            print(f"[Worker Cache Hit] Review already completed for commit {commit_sha}. Skipping API invocation.", flush=True)
+            print(f"[Worker Cache Hit] Review already completed for commit {commit_sha}. Skipping.", flush=True)
             return
 
-        if not gemini_client:
-            print("[Worker Error] Gemini Client not initialized. Skipping review computation.", flush=True)
+        if not gemini_async_client:
+            print("[Worker Error] Gemini Async Client not initialized. Exiting task.", flush=True)
             return
 
         # 2. Dynamically fetch real diff via HTTPX
@@ -90,13 +85,14 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
             print("[Worker Error] Could not find diff_url in payload.", flush=True)
             return
             
+        print(f"[Worker Progress] Downloading raw diff text from GitHub...", flush=True)
         headers = {"Accept": "application/vnd.github.v3.diff"}
         if GITHUB_TOKEN:
             headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
             
-        diff_response = await http_client.get(diff_url, headers=headers)
+        diff_response = await http_client.get(diff_url, headers=headers, follow_redirects=True)
         if diff_response.status_code != 200:
-            print(f"[Worker Error] Failed to fetch diff from GitHub via HTTPX: {diff_response.status_code}", flush=True)
+            print(f"[Worker Error] Failed to fetch diff from GitHub via HTTPX. Code: {diff_response.status_code}", flush=True)
             return
             
         real_diff = diff_response.text
@@ -110,11 +106,11 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
             "Return your critical response structured in clean markdown format."
         )
 
-        # 3. Invoke Gemini Inference via MODERN NON-BLOCKING ASYNC SDK (.aio) ◄ NEW
-        print(f"[Worker Progress] Handshaking with Gemini 3.8-Flash engine...", flush=True)
+        # 3. Invoke Gemini Inference via MODERN NON-BLOCKING ASYNC SDK (.aio)
+        print(f"[Worker Progress] Forwarding code blocks to Gemini 3.8-Flash engine...", flush=True)
         
-        # We leverage the .aio property of the modern Google GenAI Client wrapper
-        response = await gemini_client.aio.models.generate_content(
+        # Using the cleanly instantiated global async client directly
+        response = await gemini_async_client.models.generate_content(
             model='gemini-3.8-flash',  
             contents=f"Analyze this code diff payload:\n{real_diff}",
             config=types.GenerateContentConfig(
@@ -123,7 +119,7 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
         )
         
         generated_review = response.text
-        print(f"[Worker Success] Generated Review Output for {commit_sha}", flush=True)
+        print(f"[Worker Success] Successfully generated LLM report for {commit_sha}", flush=True)
 
         # 4. Write back to Redis Cache with a 24-hour TTL
         await redis_client.setex(cache_key, 86400, generated_review)
@@ -133,57 +129,63 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
             repo_full_name = pr_data.get("repository", {}).get("full_name")
             pr_number = pr_data.get("number")
             
-            print(f"[Worker Progress] Posting text blocks to GitHub repository...", flush=True)
+            print(f"[Worker Progress] Dispatching comment blocks to GitHub PR #{pr_number}...", flush=True)
             auth = Auth.Token(GITHUB_TOKEN)
             g = Github(auth=auth)
             
             repo = g.get_repo(repo_full_name)
             pull_request = repo.get_pull(pr_number)
             
+            # Executing synchronous post isolated inside the decoupled async worker task 
             pull_request.create_issue_comment(generated_review)
-            print(f"[GitHub Success] Posted review comment to PR #{pr_number}", flush=True)
+            print(f"🎉 [GitHub Success] Code Review completely posted to PR #{pr_number}!", flush=True)
         else:
-            print("[Warning] GITHUB_TOKEN not found. Skipping comment insertion.", flush=True)
+            print("[Warning] GITHUB_TOKEN not found. Skipping GitHub comment submission.", flush=True)
 
     except Exception as worker_error:
-        # ◄ THE CRITICAL BACKEND WRAPPER: Catches any silent failures and prints them explicitly
+        # Catches any underlying library initialization exceptions and prints the raw error trace
         print(f"\n❌ [FATAL WORKER CRASH] An exception occurred inside the background worker thread!", flush=True)
-        print(f"Details: {str(worker_error)}", flush=True)
+        print(f"Error Details: {str(worker_error)}", flush=True)
         import traceback
         traceback.print_exc()
 
-@app.post("/webhook/github", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_github_signature)])
-async def github_webhook_endpoint(request: Request, background_tasks: BackgroundTasks):
+@app.post("/webhook/github", status_code=status.HTTP_202_ACCEPTED)
+async def github_webhook_endpoint(request: Request):
     """
     Main ingestion endpoint for GitHub Webhook events.
-    Parses the raw stream safely *after* the signature dependency verification executes.
+    Verifies signatures and fires background tasks natively via asyncio.create_task.
     """
-    # 1. Read the raw body text explicitly to ensure the stream is processed correctly
+    signature_header = request.headers.get("X-Hub-Signature-256")
     body_bytes = await request.body()
     
-    # 2. Parse the body bytes into JSON manually to avoid empty stream exceptions
+    if not verify_github_signature_raw(body_bytes, signature_header):
+        print(f"[Security Alert] Cryptographic check failed. Check secret values.", flush=True)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cryptographic verification failed.")
+        
     try:
         payload = json.loads(body_bytes.decode('utf-8'))
     except json.JSONDecodeError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload received")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload")
         
     action = payload.get("action")
     
     if action in ["opened", "synchronize"]:
-        # Extract unique commit SHA to ensure idempotency across repetitive webhooks
         commit_sha = payload.get("pull_request", {}).get("head", {}).get("sha", "default_mock_sha")
         cache_key = f"pr_review:{commit_sha}"
         
-        # Immediate Cache Lookahead (Fast Path)
         cached_review = await redis_client.get(cache_key)
         if cached_review:
+            print(f"[Endpoint Log] Cache hit detected for {commit_sha}. Returning instantly.", flush=True)
             return {
                 "status": "cached",
-                "detail": f"Review for commit {commit_sha} fetched from cache. Skipping computational task execution."
+                "detail": f"Review for commit {commit_sha} fetched from cache."
             }
         
-        # Offload computationally heavy tasks to a background worker loop immediately
-        background_tasks.add_task(process_pr_review_task, commit_sha, payload)
-        return {"status": "accepted", "detail": "Pull Request event queued for architectural processing"}
+        print(f"[Endpoint Log] Enqueueing process task for commit: {commit_sha}...", flush=True)
+        
+        # Native, zero-overhead background scheduling
+        asyncio.create_task(process_pr_review_task(commit_sha, payload))
+        
+        return {"status": "accepted", "detail": "Pull Request event queued natively via asyncio"}
         
     return {"status": "ignored", "detail": "Action event bypassed"}
