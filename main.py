@@ -153,15 +153,25 @@ async def process_pr_review_task(commit_sha: str, pr_data: dict):
 async def github_webhook_endpoint(request: Request, background_tasks: BackgroundTasks):
     """
     Main ingestion endpoint for GitHub Webhook events.
-    Utilizes Redis to check for redundant review tasks before queuing background operations.
+    Parses the raw stream safely *after* the signature dependency verification executes.
     """
-    payload = await request.json()
+    # 1. Read the raw body text explicitly to ensure the stream is processed correctly
+    body_bytes = await request.body()
+    
+    # 2. Parse the body bytes into JSON manually to avoid empty stream exceptions
+    try:
+        payload = json.loads(body_bytes.decode('utf-8'))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload received")
+        
     action = payload.get("action")
     
     if action in ["opened", "synchronize"]:
+        # Extract unique commit SHA to ensure idempotency across repetitive webhooks
         commit_sha = payload.get("pull_request", {}).get("head", {}).get("sha", "default_mock_sha")
         cache_key = f"pr_review:{commit_sha}"
         
+        # Immediate Cache Lookahead (Fast Path)
         cached_review = await redis_client.get(cache_key)
         if cached_review:
             return {
@@ -169,6 +179,7 @@ async def github_webhook_endpoint(request: Request, background_tasks: Background
                 "detail": f"Review for commit {commit_sha} fetched from cache. Skipping computational task execution."
             }
         
+        # Offload computationally heavy tasks to a background worker loop immediately
         background_tasks.add_task(process_pr_review_task, commit_sha, payload)
         return {"status": "accepted", "detail": "Pull Request event queued for architectural processing"}
         
