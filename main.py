@@ -2,6 +2,7 @@ import os
 import hmac
 import hashlib
 import json
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends, status
 from google import genai
 from google.genai import types
@@ -9,6 +10,8 @@ import redis.asyncio as aioredis
 import httpx
 from github import Github     
 from github import Auth       
+
+load_dotenv()  # Load environment variables from .env file
 
 app = FastAPI(title="Fully Async GitHub PR Reviewer API", version="1.2.0")
 
